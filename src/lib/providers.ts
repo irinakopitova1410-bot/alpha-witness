@@ -23,7 +23,7 @@ function validClaim(rawClaim: unknown, index: number, evidence: EvidenceItem[]):
 }
 
 export class GeminiProvider implements ClaimAnalysisProvider {
-  constructor(private readonly apiKey: string, private readonly model = process.env.GEMINI_MODEL || 'gemini-2.0-flash') {}
+  constructor(private readonly apiKey: string, private readonly model = process.env.GEMINI_MODEL || 'gemini-2.5-flash') {}
   async analyze(input: { classification: string; evidence: EvidenceItem[]; clientKey?: string }): Promise<{ claims: Claim[]; availability: Availability }> {
     const limited = rateLimit('gemini', input.clientKey || 'unknown', 12, 10 * 60_000);
     if (!limited.allowed) return { claims: [], availability: 'PARTIAL_ANALYSIS' };
