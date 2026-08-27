@@ -3,7 +3,8 @@ import type { Availability, CaseFile, CreateInput, EvidenceItem, Provenance } fr
 import { MAX_PDF_BYTES } from './contracts';
 import { classifyInput } from './classifier';
 import { fetchPublicUrl } from './ssrf';
-import { bytesToText, htmlTitle, htmlToText } from './extract';
+import { bytesToText, htmlTitle, htmlToText, pdfToText } from './extract';
+import { acquireKrakenMarketEvidence } from './market';
 import { getClaimProvider, unavailableClaimResult } from './providers';
 import { makeVerdict } from './verdict';
 import { getCaseRepository } from './repositoryFactory';
@@ -12,6 +13,19 @@ const now = () => new Date().toISOString();
 const id = () => `AW-${crypto.randomBytes(18).toString('base64url')}`;
 function provenance(sourceType: Provenance['sourceType'], extra: Partial<Provenance> = {}): Provenance { return { sourceType, retrievedAt: now(), ...extra }; }
 function sourceEvidence(content: string, p: Provenance, title: string): EvidenceItem { return { id: `evidence-${crypto.randomBytes(8).toString('hex')}`, kind: 'SOURCE', title, content: content.slice(0, 200_000), availability: 'AVAILABLE', provenance: p, hash: crypto.createHash('sha256').update(content).digest('hex') }; }
+async function pdfEvidence(bytes: Uint8Array, title: string, sourceUrl?: string): Promise<EvidenceItem> {
+  const hash = crypto.createHash('sha256').update(bytes).digest('hex');
+  try {
+    const extracted = await Promise.race([
+      pdfToText(bytes),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('PDF_EXTRACTION_TIMEOUT')), 15_000))
+    ]);
+    if (!extracted.text) return { id: `evidence-${crypto.randomBytes(8).toString('hex')}`, kind: 'SOURCE', title, content: 'PDF text extraction: NON_AVAILABLE. The file may be image-only or contain no extractable text. No claims were generated from unavailable text.', availability: 'NON_AVAILABLE', provenance: provenance('PDF', { sourceUrl, contentType: 'application/pdf', title, note: `PDF contained ${extracted.totalPages} page(s); metadata and SHA-256 were recorded; bytes are not persisted.` }), hash };
+    return { ...sourceEvidence(extracted.text, provenance('PDF', { sourceUrl, contentType: 'application/pdf', title, note: `Extracted page-marked text from ${extracted.totalPages} page(s); SHA-256 recorded; uploaded bytes are not persisted.` }), title), hash };
+  } catch (error: unknown) {
+    return { id: `evidence-${crypto.randomBytes(8).toString('hex')}`, kind: 'SOURCE', title, content: 'PDF text extraction: NON_AVAILABLE. No claims were generated from this file.', availability: 'NON_AVAILABLE', provenance: provenance('PDF', { sourceUrl, contentType: 'application/pdf', title, note: `Extraction failed (${error instanceof Error ? error.message : 'unknown error'}); SHA-256 recorded; bytes are not persisted.` }), hash };
+  }
+}
 
 export function robotsAllowsPath(robotsText: string, pathname: string, userAgent = 'alphawitness'): boolean {
   type Group = { agents: string[]; disallow: string[] };
@@ -54,7 +68,7 @@ async function acquire(input: CreateInput): Promise<{ title: string; evidence: E
     const bytes = Buffer.from(input.value, 'base64');
     if (bytes.length < 5 || bytes.length > MAX_PDF_BYTES || bytes.subarray(0, 5).toString() !== '%PDF-') throw new Error('INVALID_PDF');
     const title = input.label || 'Uploaded PDF';
-    return { title, evidence: [{ id: `evidence-${crypto.randomBytes(8).toString('hex')}`, kind: 'SOURCE', title, content: 'PDF text extraction: NON_AVAILABLE. No claims were generated from this file.', availability: 'NON_AVAILABLE', provenance: provenance('PDF', { contentType: 'application/pdf', title, note: 'PDF metadata and SHA-256 were recorded; bytes are not persisted.' }), hash: crypto.createHash('sha256').update(bytes).digest('hex') }] };
+    return { title, evidence: [await pdfEvidence(bytes, title)] };
   }
   await assertRobotsAllowed(input.value);
   const fetched = await fetchPublicUrl(input.value);
@@ -68,7 +82,10 @@ async function acquire(input: CreateInput): Promise<{ title: string; evidence: E
     const content = title ? `YouTube title: ${title}\n${note}` : note;
     return { title: title || 'YouTube source', evidence: [sourceEvidence(content, provenance('YOUTUBE_OEMBED', { sourceUrl: finalUrl, title, note }), title || 'YouTube source')] };
   }
-  if (fetched.contentType === 'application/pdf') return { title: 'PDF source', evidence: [{ ...sourceEvidence('', provenance('PDF', { sourceUrl: finalUrl, contentType: fetched.contentType, note: 'PDF extraction: NON_AVAILABLE in this MVP.' }), 'PDF source'), availability: 'NON_AVAILABLE', content: 'PDF text extraction: NON_AVAILABLE. No claims were generated from this file.' }] };
+  if (fetched.contentType === 'application/pdf') {
+    const pathname = new URL(finalUrl).pathname; const title = decodeURIComponent(pathname.split('/').pop() || 'PDF source').slice(0, 200);
+    return { title, evidence: [await pdfEvidence(fetched.bytes, title, finalUrl)] };
+  }
   const raw = bytesToText(fetched.bytes); const content = fetched.contentType === 'text/html' || fetched.contentType === 'application/xhtml+xml' ? htmlToText(raw) : raw;
   if (!content) throw new Error('EMPTY_SOURCE_TEXT');
   const title = htmlTitle(raw) || new URL(finalUrl).hostname;
@@ -89,6 +106,11 @@ export async function createAndProcessCase(input: CreateInput, options: { client
   try {
     caseFile.status = 'ACQUIRING'; caseFile.updatedAt = now(); await repository.put(caseFile);
     const acquired = await acquire(input); caseFile.title = acquired.title; caseFile.evidenceLedger = acquired.evidence;
+    if (caseFile.classification === 'UNKNOWN') {
+      const routingText = acquired.evidence.filter((item) => item.availability === 'AVAILABLE').map((item) => item.content.slice(0, 20_000)).join('\n');
+      caseFile.classification = classifyInput(routingText, acquired.title);
+    }
+    if (input.kind === 'ticker' && caseFile.classification === 'ASSET') caseFile.evidenceLedger.push(await acquireKrakenMarketEvidence(input.value));
     caseFile.status = 'ANALYZING'; caseFile.updatedAt = now(); await repository.put(caseFile);
     const provider = getClaimProvider();
     const result = provider && caseFile.evidenceLedger.some((item) => item.availability === 'AVAILABLE') ? await provider.analyze({ classification: caseFile.classification, evidence: caseFile.evidenceLedger, clientKey: options.clientKey }) : unavailableClaimResult();
